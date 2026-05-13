@@ -1,0 +1,372 @@
+import os
+import uuid
+import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete
+from sqlalchemy.orm import selectinload
+
+from database import engine, Base, get_db, async_session
+from models import User, Category, MenuItem, Cart, CartItem, Order, OrderItem, Machine, OrderStatus
+from schemas import (
+    CategoryOut, MenuItemOut, CartOut, CartItemOut, OrderOut, OrderItemOut,
+    MachineOut, QRValidateOut, CreateOrderIn, AddToCartIn
+)
+from auth import get_password_hash, verify_password, create_access_token, get_current_user
+from websocket_manager import manager
+
+# Seed data
+async def seed_data():
+    async with async_session() as db:
+        # Check if data exists
+        result = await db.execute(select(Category))
+        if result.scalars().first():
+            return
+
+        # Categories
+        snacks = Category(id="cat_snacks", name="Snacks", tagline="Crunch & Munch", price_label="$2-5", icon="cookie")
+        drinks = Category(id="cat_drinks", name="Drinks", tagline="Refresh & Recharge", price_label="$1-4", icon="cup")
+        meals = Category(id="cat_meals", name="Meals", tagline="Hot & Ready", price_label="$6-12", icon="utensils")
+        sweets = Category(id="cat_sweets", name="Sweets", tagline="Sugar Rush", price_label="$1-3", icon="candy")
+
+        db.add_all([snacks, drinks, meals, sweets])
+        await db.flush()
+
+        # Menu Items
+        items = [
+            MenuItem(id="item_1", category_id=snacks.id, name="Neon Chips", description="Radioactive sour cream chips", price=3.50, image_url="/assets/chips.png", stock=15, is_available=True, nutrition={"calories": 250, "protein": 2, "carbs": 30, "fat": 12}),
+            MenuItem(id="item_2", category_id=snacks.id, name="Quantum Popcorn", description="Butter flux popcorn", price=4.00, image_url="/assets/popcorn.png", stock=10, is_available=True),
+            MenuItem(id="item_3", category_id=drinks.id, name="Plasma Cola", description="Electric blue energy cola", price=2.50, image_url="/assets/cola.png", stock=20, is_available=True, nutrition={"calories": 140, "protein": 0, "carbs": 35, "fat": 0}),
+            MenuItem(id="item_4", category_id=drinks.id, name="Void Water", description="Ultra-purified H2O", price=1.50, image_url="/assets/water.png", stock=50, is_available=True),
+            MenuItem(id="item_5", category_id=meals.id, name="Cyber Sandwich", description="LED-lit club sandwich", price=8.00, image_url="/assets/sandwich.png", stock=5, is_available=True, nutrition={"calories": 450, "protein": 25, "carbs": 40, "fat": 18}),
+            MenuItem(id="item_6", category_id=sweets.id, name="Glitch Brownie", description="Error 404: Diet not found", price=2.75, image_url="/assets/brownie.png", stock=8, is_available=True, nutrition={"calories": 320, "protein": 4, "carbs": 42, "fat": 16}),
+        ]
+        db.add_all(items)
+
+        # Machine
+        machine = Machine(id="machine_001", name="Vendly Alpha", location="Building A - Lobby", status="online", inventory={"item_1": 5, "item_2": 3, "item_3": 8, "item_4": 12, "item_5": 2, "item_6": 4})
+        db.add(machine)
+
+        # Demo user
+        demo_user = User(id="user_demo", email="demo@vendly.app", hashed_password=get_password_hash("demo123"))
+        db.add(demo_user)
+
+        await db.commit()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await seed_data()
+    yield
+    await engine.dispose()
+
+app = FastAPI(title="Vendly API", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==================== AUTH ====================
+
+@app.post("/api/auth/register")
+async def register(email: str, password: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.email == email))
+    if result.scalar_one_or_none():
+        raise HTTPException(400, "Email already registered")
+    user = User(email=email, hashed_password=get_password_hash(password))
+    db.add(user)
+    await db.commit()
+    token = create_access_token({"sub": user.id})
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/api/auth/login")
+async def login(email: str, password: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if not user or not verify_password(password, user.hashed_password):
+        raise HTTPException(401, "Invalid credentials")
+    token = create_access_token({"sub": user.id})
+    return {"access_token": token, "token_type": "bearer"}
+
+# ==================== CATEGORIES & MENU ====================
+
+@app.get("/api/categories", response_model=list[CategoryOut])
+async def get_categories(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Category).options(selectinload(Category.items))
+    )
+    return result.scalars().all()
+
+@app.get("/api/menu", response_model=list[MenuItemOut])
+async def get_menu(category: str | None = None, db: AsyncSession = Depends(get_db)):
+    query = select(MenuItem).where(MenuItem.is_available == True)
+    if category:
+        query = query.where(MenuItem.category_id == category)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+# ==================== CART ====================
+
+@app.get("/api/cart", response_model=CartOut)
+async def get_cart(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Cart).where(Cart.user_id == user.id).options(
+            selectinload(Cart.items).selectinload(CartItem.item)
+        )
+    )
+    cart = result.scalar_one_or_none()
+    if not cart:
+        return CartOut(items=[], total=0.0)
+    
+    total = sum(item.item.price * item.quantity for item in cart.items)
+    return CartOut(items=cart.items, total=round(total, 2))
+
+@app.post("/api/cart/items")
+async def add_to_cart(
+    data: AddToCartIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Get or create cart
+    result = await db.execute(select(Cart).where(Cart.user_id == user.id))
+    cart = result.scalar_one_or_none()
+    if not cart:
+        cart = Cart(user_id=user.id)
+        db.add(cart)
+        await db.flush()
+
+    # Check item exists and has stock
+    item_result = await db.execute(select(MenuItem).where(MenuItem.id == data.item_id))
+    item = item_result.scalar_one_or_none()
+    if not item or not item.is_available:
+        raise HTTPException(404, "Item not found or unavailable")
+    
+    # Check cart item
+    cart_item_result = await db.execute(
+        select(CartItem).where(CartItem.cart_id == cart.id, CartItem.item_id == data.item_id)
+    )
+    cart_item = cart_item_result.scalar_one_or_none()
+    
+    if cart_item:
+        cart_item.quantity += data.quantity
+    else:
+        cart_item = CartItem(cart_id=cart.id, item_id=data.item_id, quantity=data.quantity)
+        db.add(cart_item)
+    
+    await db.commit()
+    return {"success": True}
+
+@app.delete("/api/cart/items/{item_id}")
+async def remove_from_cart(
+    item_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Cart).where(Cart.user_id == user.id).options(selectinload(Cart.items))
+    )
+    cart = result.scalar_one_or_none()
+    if not cart:
+        raise HTTPException(404, "Cart not found")
+    
+    await db.execute(
+        delete(CartItem).where(CartItem.cart_id == cart.id, CartItem.item_id == item_id)
+    )
+    await db.commit()
+    return {"success": True}
+
+# ==================== ORDERS ====================
+
+@app.post("/api/orders", response_model=OrderOut)
+async def create_order(
+    data: CreateOrderIn,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Get cart
+    result = await db.execute(
+        select(Cart).where(Cart.user_id == user.id).options(
+            selectinload(Cart.items).selectinload(CartItem.item)
+        )
+    )
+    cart = result.scalar_one_or_none()
+    if not cart or not cart.items:
+        raise HTTPException(400, "Cart is empty")
+    
+    # Calculate total
+    total = sum(item.item.price * item.quantity for item in cart.items)
+    
+    # Create order
+    order = Order(
+        user_id=user.id,
+        status=OrderStatus.PENDING,
+        total=round(total, 2),
+        machine_id=data.machine_id,
+        delivery_type=data.delivery_type,
+        address=data.address,
+        payment_method=data.payment_method,
+        qr_code=str(uuid.uuid4())[:8].upper()
+    )
+    db.add(order)
+    await db.flush()
+    
+    # Add order items
+    for cart_item in cart.items:
+        order_item = OrderItem(
+            order_id=order.id,
+            item_id=cart_item.item_id,
+            quantity=cart_item.quantity,
+            price=cart_item.item.price
+        )
+        db.add(order_item)
+    
+    # Clear cart
+    await db.execute(delete(CartItem).where(CartItem.cart_id == cart.id))
+    
+    await db.commit()
+    
+    # Load full order for response
+    result = await db.execute(
+        select(Order).where(Order.id == order.id).options(
+            selectinload(Order.items).selectinload(OrderItem.item)
+        )
+    )
+    order = result.scalar_one()
+    
+    # Notify via WebSocket
+    await manager.send_to_user(user.id, {
+        "type": "order_created",
+        "order": OrderOut.model_validate(order).model_dump(mode="json")
+    })
+    
+    # Simulate order progression (async background task)
+    asyncio.create_task(simulate_order_progress(order.id, user.id))
+    
+    return order
+
+async def simulate_order_progress(order_id: str, user_id: str):
+    """Simulate kitchen/vending machine processing for demo purposes"""
+    await asyncio.sleep(5)  # Preparing
+    async with async_session() as db:
+        result = await db.execute(select(Order).where(Order.id == order_id))
+        order = result.scalar_one_or_none()
+        if order and order.status == OrderStatus.PENDING:
+            order.status = OrderStatus.PREPARING
+            await db.commit()
+            await manager.send_to_user(user_id, {
+                "type": "order_update",
+                "order_id": order_id,
+                "status": "preparing"
+            })
+            await manager.send_to_order(order_id, {
+                "type": "status_change",
+                "status": "preparing"
+            })
+    
+    await asyncio.sleep(5)  # Ready
+    async with async_session() as db:
+        result = await db.execute(select(Order).where(Order.id == order_id))
+        order = result.scalar_one_or_none()
+        if order and order.status == OrderStatus.PREPARING:
+            order.status = OrderStatus.READY
+            await db.commit()
+            await manager.send_to_user(user_id, {
+                "type": "order_update",
+                "order_id": order_id,
+                "status": "ready"
+            })
+            await manager.send_to_order(order_id, {
+                "type": "status_change",
+                "status": "ready"
+            })
+
+@app.get("/api/orders", response_model=list[OrderOut])
+async def get_orders(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Order).where(Order.user_id == user.id).options(
+            selectinload(Order.items).selectinload(OrderItem.item)
+        ).order_by(Order.created_at.desc())
+    )
+    return result.scalars().all()
+
+@app.get("/api/orders/{order_id}", response_model=OrderOut)
+async def get_order(order_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Order).where(Order.id == order_id, Order.user_id == user.id).options(
+            selectinload(Order.items).selectinload(OrderItem.item)
+        )
+    )
+    order = result.scalar_one_or_none()
+    if not order:
+        raise HTTPException(404, "Order not found")
+    return order
+
+# ==================== MACHINE ====================
+
+@app.get("/api/machines/{machine_id}", response_model=MachineOut)
+async def get_machine(machine_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Machine).where(Machine.id == machine_id))
+    machine = result.scalar_one_or_none()
+    if not machine:
+        raise HTTPException(404, "Machine not found")
+    return machine
+
+# ==================== QR ====================
+
+@app.post("/api/qr/validate", response_model=QRValidateOut)
+async def validate_qr(qr_data: dict, db: AsyncSession = Depends(get_db)):
+    # In production, decode JWT or encrypted QR payload
+    machine_id = qr_data.get("qrData", "").replace("machine:", "")
+    result = await db.execute(select(Machine).where(Machine.id == machine_id))
+    machine = result.scalar_one_or_none()
+    if machine and machine.status == "online":
+        return QRValidateOut(machine_id=machine.id, valid=True)
+    # Fallback for demo
+    if machine_id == "machine_001":
+        return QRValidateOut(machine_id=machine_id, valid=True)
+    raise HTTPException(400, "Invalid or expired QR code")
+
+# ==================== WEBSOCKETS ====================
+
+@app.websocket("/ws/user/{token}")
+async def user_websocket(websocket: WebSocket, token: str):
+    try:
+        from jose import jwt as jose_jwt
+        payload = jose_jwt.decode(token, "your-super-secret-key-change-in-production", algorithms=["HS256"])
+        user_id = payload.get("sub")
+        if not user_id:
+            await websocket.close(code=4001)
+            return
+    except Exception:
+        await websocket.close(code=4001)
+        return
+    
+    await manager.connect_user(websocket, user_id)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            # Handle client messages if needed
+    except WebSocketDisconnect:
+        manager.disconnect_user(websocket, user_id)
+
+@app.websocket("/ws/order/{order_id}")
+async def order_websocket(websocket: WebSocket, order_id: str):
+    await manager.cconnect_order(websocket, order_id)
+    try:
+        while True:
+            data = await websocket.receive_json()
+    except WebSocketDisconnect:
+        manager.disconnect_order(websocket, order_id)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=3001, reload=True)
